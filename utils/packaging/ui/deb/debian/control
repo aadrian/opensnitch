@@ -29,6 +29,7 @@ Depends:
  python3-protobuf,
  python3-packaging,
  python3-slugify,
+ python3-requests,
  python3-notify2,
  xdg-user-dirs,
  gtk-update-icon-cache
