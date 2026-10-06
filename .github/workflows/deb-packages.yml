@@ -1,0 +1,211 @@
+name: Debian packages
+
+# Builds the daemon and UI .debs once, on the oldest supported base (glibc 2.34+),
+# then installs the same files on each target, fresh and as an upgrade from 1.8.0.
+# Called by linux-packages.yml, which has the triggers.
+on:
+  workflow_call:
+    inputs:
+      snapshot:
+        description: 'Test build id for the package version (see utils/ci/pkg-version.sh), empty for none'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  PKG_SNAPSHOT: ${{ inputs.snapshot }}
+  DEBFULLNAME: ${{ github.repository_owner }}
+  DEBEMAIL: ${{ github.repository_owner }}@users.noreply.github.com
+
+# nodejs is installed in each container because act runs JavaScript actions inside it.
+
+jobs:
+  build-ebpf:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs git wget xz-utils ca-certificates make gcc flex bison bc rsync python3 \
+            libssl-dev clang llvm libelf-dev
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: .ci-cache
+          key: linux-6.0
+
+      - name: Build eBPF modules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-ebpf.sh ebpf .ci-cache
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-modules
+          path: ebpf/opensnitch*.o
+
+  build-daemon:
+    needs: build-ebpf
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs git ca-certificates make dpkg-dev debhelper dh-golang pkg-config \
+            libnetfilter-queue-dev libmnl-dev protobuf-compiler
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: daemon/go.mod
+          cache: false
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ebpf-modules
+          path: ebpf
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-daemon-deb.sh ebpf dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-deb
+          path: dist/*.deb
+
+  test-daemon:
+    needs: build-daemon
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:trixie', 'ubuntu:24.04', 'ubuntu:26.04']
+    env:
+      OLD_DEB_URL: https://github.com/evilsocket/opensnitch/releases/download/v1.8.0/opensnitch_1.8.0-1_amd64.deb
+      OLD_DEB_SHA256: 9f517926877f07761ca95ec43dc9daefecac582574f9856079e1064be3fa1c8a
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs wget ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon-deb
+          path: dist
+
+      - name: Fresh install
+        run: |
+          apt-get install -y -qq ./dist/opensnitch_*.deb
+          utils/ci/smoke-daemon.sh
+          apt-get purge -y -qq opensnitch
+
+      - name: Upgrade from 1.8.0
+        run: |
+          wget -q -O /tmp/old.deb "$OLD_DEB_URL"
+          echo "$OLD_DEB_SHA256  /tmp/old.deb" | sha256sum -c -
+          apt-get install -y -qq /tmp/old.deb
+          apt-get install -y -qq ./dist/opensnitch_*.deb
+          test "$(dpkg-query -W -f='${Version}' opensnitch)" = "$(dpkg-deb -f dist/opensnitch_*.deb Version)"
+          dpkg -S /usr/lib/systemd/system/opensnitch.service
+          utils/ci/smoke-daemon.sh
+
+      # The command the test release notes give for switching between builds.
+      - name: Switch to 1.8.0 and back
+        run: |
+          apt-get install -y -qq --reinstall --allow-downgrades /tmp/old.deb
+          test "$(dpkg-query -W -f='${Version}' opensnitch)" = 1.8.0-1
+          apt-get install -y -qq --reinstall --allow-downgrades ./dist/opensnitch_*.deb
+          test "$(dpkg-query -W -f='${Version}' opensnitch)" = "$(dpkg-deb -f dist/opensnitch_*.deb Version)"
+          utils/ci/smoke-daemon.sh
+
+  build-ui:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs git ca-certificates build-essential dpkg-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install the declared Build-Depends
+        run: apt-get build-dep -y -qq ./utils/packaging/ui/deb
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-ui-deb.sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-deb
+          path: dist/*.deb
+
+  test-ui:
+    needs: build-ui
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:trixie', 'ubuntu:24.04', 'ubuntu:26.04']
+    env:
+      OLD_DEB_URL: https://github.com/evilsocket/opensnitch/releases/download/v1.8.0/python3-opensnitch-ui_1.8.0-1_all.deb
+      OLD_DEB_SHA256: 3597e6ae5eedbf706622cd64bddc9649acca165ac1f63a444585dfda5435003d
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs wget ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-deb
+          path: dist
+
+      - name: Fresh install and launch
+        run: |
+          apt-get install -y -qq ./dist/python3-opensnitch-ui_*.deb
+          utils/ci/smoke-ui.sh
+          apt-get purge -y -qq python3-opensnitch-ui
+
+      - name: Upgrade from 1.8.0 and launch
+        run: |
+          wget -q -O /tmp/old.deb "$OLD_DEB_URL"
+          echo "$OLD_DEB_SHA256  /tmp/old.deb" | sha256sum -c -
+          apt-get install -y -qq /tmp/old.deb
+          apt-get install -y -qq ./dist/python3-opensnitch-ui_*.deb
+          test "$(dpkg-query -W -f='${Version}' python3-opensnitch-ui)" = "$(dpkg-deb -f dist/python3-opensnitch-ui_*.deb Version)"
+          utils/ci/smoke-ui.sh
+
+      # The command the test release notes give for switching between builds.
+      - name: Switch to 1.8.0 and back
+        run: |
+          apt-get install -y -qq --reinstall --allow-downgrades /tmp/old.deb
+          test "$(dpkg-query -W -f='${Version}' python3-opensnitch-ui)" = 1.8.0-1
+          apt-get install -y -qq --reinstall --allow-downgrades ./dist/python3-opensnitch-ui_*.deb
+          test "$(dpkg-query -W -f='${Version}' python3-opensnitch-ui)" = "$(dpkg-deb -f dist/python3-opensnitch-ui_*.deb Version)"
+          utils/ci/smoke-ui.sh
