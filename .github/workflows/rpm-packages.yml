@@ -1,0 +1,175 @@
+name: RPM packages
+
+# Builds the daemon and UI .rpms once, on the oldest supported Fedora, then installs the
+# same files on each target, fresh and as an upgrade from 1.8.0.
+# Called by linux-packages.yml, which has the triggers and builds the eBPF modules.
+on:
+  workflow_call:
+    inputs:
+      snapshot:
+        description: 'Test build id for the package version (see utils/ci/pkg-version.sh), empty for none'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  PKG_SNAPSHOT: ${{ inputs.snapshot }}
+  # Containers have no running systemd: systemctl in the scriptlets then enables and
+  # disables the unit, but skips start and stop instead of failing.
+  SYSTEMD_OFFLINE: 1
+
+# nodejs is installed in each container because act runs JavaScript actions inside it.
+
+jobs:
+  build-daemon:
+    runs-on: ubuntu-latest
+    container: fedora:43
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf -y -q install nodejs git rpm-build golang make gcc protobuf-compiler libnetfilter_queue-devel \
+            python3-pip
+          GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+          GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+          # The spec runs the whole proto/Makefile, which needs --pyi_out: Fedora's
+          # python3-grpcio-tools (1.48) lacks it. Not in /usr/local: Fedora's python
+          # leaves that out of sys.path inside rpmbuild.
+          python3 -m pip install -q --root-user-action=ignore --target /opt/grpc-tools grpcio-tools
+          echo "PYTHONPATH=/opt/grpc-tools" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ebpf-modules
+          path: ebpf
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-daemon-rpm.sh ebpf dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-rpm
+          path: dist/*.rpm
+
+  test-daemon:
+    needs: build-daemon
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['fedora:43', 'fedora:44', 'fedora:45']
+    env:
+      OLD_RPM_URL: https://github.com/evilsocket/opensnitch/releases/download/v1.8.0/opensnitch-1.8.0-1.x86_64.rpm
+      OLD_RPM_SHA256: e06e9119daf764e56455b61c319e496274c0274bb53bb94a0ff1ab72967fea7d
+    steps:
+      - name: Install dependencies
+        run: dnf -y -q install nodejs systemd
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon-rpm
+          path: dist
+
+      - name: Fresh install
+        run: |
+          dnf -y -q install ./dist/opensnitch-[0-9]*.rpm
+          utils/ci/smoke-daemon.sh
+          dnf -y -q remove opensnitch
+
+      - name: Upgrade from 1.8.0
+        run: |
+          curl -fsSL -o /tmp/old.rpm "$OLD_RPM_URL"
+          echo "$OLD_RPM_SHA256  /tmp/old.rpm" | sha256sum -c -
+          dnf -y -q install /tmp/old.rpm
+          # A local change, which every switch below must keep (the release notes say so).
+          echo ' ' >> /etc/opensnitchd/default-config.json
+          cp /etc/opensnitchd/default-config.json /tmp/changed-config.json
+          dnf -y -q install ./dist/opensnitch-[0-9]*.rpm
+          test "$(rpm -q opensnitch)" = "$(rpm -qp dist/opensnitch-[0-9]*.rpm)"
+          cmp /etc/opensnitchd/default-config.json /tmp/changed-config.json
+          systemctl is-enabled opensnitch
+          utils/ci/smoke-daemon.sh
+
+      # The command the test release notes give for switching between builds.
+      - name: Switch to 1.8.0 and back
+        run: |
+          dnf -y -q install /tmp/old.rpm
+          test "$(rpm -q opensnitch)" = opensnitch-1.8.0-1.x86_64
+          cmp /etc/opensnitchd/default-config.json /tmp/changed-config.json
+          dnf -y -q install ./dist/opensnitch-[0-9]*.rpm
+          test "$(rpm -q opensnitch)" = "$(rpm -qp dist/opensnitch-[0-9]*.rpm)"
+          cmp /etc/opensnitchd/default-config.json /tmp/changed-config.json
+          utils/ci/smoke-daemon.sh
+
+  build-ui:
+    runs-on: ubuntu-latest
+    container: fedora:43
+    steps:
+      - name: Install dependencies
+        run: dnf -y -q install nodejs git rpm-build make python3-setuptools qt6-linguist
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-ui-rpm.sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-rpm
+          path: dist/*.rpm
+
+  test-ui:
+    needs: build-ui
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['fedora:43', 'fedora:44', 'fedora:45']
+    env:
+      OLD_RPM_URL: https://github.com/evilsocket/opensnitch/releases/download/v1.8.0/opensnitch-ui-1.8.0-1.noarch.rpm
+      OLD_RPM_SHA256: e5527b6b0040f771cd5345d4917269f0fe98b6d06064bae15f4ab937e45b4a08
+    steps:
+      - name: Install dependencies
+        run: dnf -y -q install nodejs systemd
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-rpm
+          path: dist
+
+      - name: Fresh install and launch
+        run: |
+          dnf -y -q install ./dist/opensnitch-ui-*.rpm
+          utils/ci/smoke-ui.sh
+          dnf -y -q remove opensnitch-ui
+
+      - name: Upgrade from 1.8.0 and launch
+        run: |
+          curl -fsSL -o /tmp/old.rpm "$OLD_RPM_URL"
+          echo "$OLD_RPM_SHA256  /tmp/old.rpm" | sha256sum -c -
+          dnf -y -q install /tmp/old.rpm
+          dnf -y -q install ./dist/opensnitch-ui-*.rpm
+          test "$(rpm -q opensnitch-ui)" = "$(rpm -qp dist/opensnitch-ui-*.rpm)"
+          utils/ci/smoke-ui.sh
+
+      # The command the test release notes give for switching between builds.
+      - name: Switch to 1.8.0 and back
+        run: |
+          dnf -y -q install /tmp/old.rpm
+          test "$(rpm -q opensnitch-ui)" = opensnitch-ui-1.8.0-1.noarch
+          dnf -y -q install ./dist/opensnitch-ui-*.rpm
+          test "$(rpm -q opensnitch-ui)" = "$(rpm -qp dist/opensnitch-ui-*.rpm)"
+          utils/ci/smoke-ui.sh

@@ -2,7 +2,7 @@ name: Debian packages
 
 # Builds the daemon and UI .debs once, on the oldest supported base (glibc 2.34+),
 # then installs the same files on each target, fresh and as an upgrade from 1.8.0.
-# Called by linux-packages.yml, which has the triggers.
+# Called by linux-packages.yml, which has the triggers and builds the eBPF modules.
 on:
   workflow_call:
     inputs:
@@ -23,35 +23,7 @@ env:
 # nodejs is installed in each container because act runs JavaScript actions inside it.
 
 jobs:
-  build-ebpf:
-    runs-on: ubuntu-latest
-    container: ubuntu:24.04
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq nodejs git wget xz-utils ca-certificates make gcc flex bison bc rsync python3 \
-            libssl-dev clang llvm libelf-dev
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/cache@v4
-        with:
-          path: .ci-cache
-          key: linux-6.0
-
-      - name: Build eBPF modules
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          utils/ci/build-ebpf.sh ebpf .ci-cache
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ebpf-modules
-          path: ebpf/opensnitch*.o
-
   build-daemon:
-    needs: build-ebpf
     runs-on: ubuntu-latest
     container: ubuntu:24.04
     steps:

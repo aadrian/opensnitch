@@ -18,16 +18,48 @@ permissions:
   contents: read
 
 jobs:
+  # The modules go into the debs and the rpms alike (the 1.8.0 release ships the same
+  # files in both).
+  build-ebpf:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs git wget xz-utils ca-certificates make gcc flex bison bc rsync python3 \
+            libssl-dev clang llvm libelf-dev
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: .ci-cache
+          key: linux-6.0
+
+      - name: Build eBPF modules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          utils/ci/build-ebpf.sh ebpf .ci-cache
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-modules
+          path: ebpf/opensnitch*.o
+
   deb:
+    needs: build-ebpf
     uses: ./.github/workflows/deb-packages.yml
     with:
       snapshot: ci${{ github.run_number }}
 
-  # Not there yet: rpm packages, built and tested like the debs, with the same snapshot.
-  # rpm:
-  #   uses: ./.github/workflows/rpm-packages.yml
-  #   with:
-  #     snapshot: ci${{ github.run_number }}
+  rpm:
+    needs: build-ebpf
+    uses: ./.github/workflows/rpm-packages.yml
+    with:
+      snapshot: ci${{ github.run_number }}
 
   # Publishing is never automatic. It needs all of:
   # - the repository variable TEST_RELEASES set to true (Settings > Secrets and variables >
@@ -37,7 +69,7 @@ jobs:
   # - whatever protection the "test-release" environment has (Settings > Environments),
   #   e.g. required reviewers. Without any, the job starts right away.
   release:
-    needs: [deb]  # add rpm here once it exists
+    needs: [deb, rpm]
     if: vars.TEST_RELEASES == 'true' && github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     environment: test-release
@@ -56,15 +88,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-rpm'
+          path: dist
+          merge-multiple: true
+
       # GitHub replaces ~ with . in uploaded file names; renaming first keeps the names in
-      # SHA256SUMS and the notes the same as on the release page. apt reads the version
-      # from inside the package, not from its file name.
+      # SHA256SUMS and the notes the same as on the release page. apt and dnf read the
+      # version from inside the package, not from its file name.
       - name: Write release notes
         run: |
           shopt -s nullglob
           for f in dist/*~*; do mv "$f" "${f//\~/.}"; done
           git fetch -q --no-tags https://github.com/evilsocket/opensnitch master
-          (cd dist && sha256sum *.deb > SHA256SUMS)
+          (cd dist && sha256sum *.deb *.rpm > SHA256SUMS)
           utils/ci/test-release-notes.sh dist FETCH_HEAD > notes.md
           cat notes.md
           ls -l dist
