@@ -11,8 +11,8 @@ on:
         description: 'Publish the tested packages as pre-release test-ci<run number> (needs the TEST_RELEASES variable)'
         type: boolean
         default: false
-  schedule:
-    - cron: '0 3 * * *'
+  # schedule:
+  #   - cron: '0 3 * * *'
 
 permissions:
   contents: read
